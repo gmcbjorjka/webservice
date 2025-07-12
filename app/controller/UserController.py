@@ -10,9 +10,10 @@ import platform
 import socket
 import requests
 import os
-from flask_jwt_extended import create_access_token
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from flask_mail import Message
 import random
+from datetime import datetime
 
 
 # --- REGISTER
@@ -70,9 +71,11 @@ def login():
             data = request.get_json()
             email = data.get('email')
             password = data.get('password')
+            device_info = data.get('device_info') or "Unknown"
         else:
             email = request.form.get('email')
             password = request.form.get('password')
+            device_info = request.form.get('device_info') or "Unknown"
 
         if not email or not password:
             return response.error([], "Email dan password harus diisi")
@@ -101,10 +104,9 @@ def login():
                 "last_failed_login": now,
             }
 
-            # Jika gagal ke-3 kalinya, blokir 1 menit dan kirim email
             if failed_count >= 3:
                 update_fields["login_block_until"] = now + timedelta(minutes=1)
-                update_fields["failed_login_count"] = 0  # reset
+                update_fields["failed_login_count"] = 0  # reset counter
 
                 # Kirim email peringatan
                 device = platform.platform()
@@ -124,7 +126,6 @@ Terdapat 3 kali percobaan login GAGAL ke akun Anda.
 
 Jika ini bukan Anda, segera ubah password Anda.
 """
-
                 mail.send(Message(
                     subject="Peringatan: Percobaan Login Gagal",
                     recipients=[email],
@@ -137,6 +138,16 @@ Jika ini bukan Anda, segera ubah password Anda.
         # Login berhasil
         access_token = create_access_token(identity=str(user['_id']))
 
+        # Simpan riwayat login
+        login_record = {
+            "user_id": user["_id"],
+            "email": user["email"],
+            "device_info": device_info,
+            "login_time": now,
+            "ip_address": request.remote_addr
+        }
+        mongo.db.login_history.insert_one(login_record)
+
         user_data = {
             "id": str(user['_id']),
             "nama": user['nama'],
@@ -146,7 +157,7 @@ Jika ini bukan Anda, segera ubah password Anda.
             "token": access_token
         }
 
-        # Reset counter dan blokir
+        # Reset counter dan blokir jika ada
         mongo.db.user.update_one({"_id": user["_id"]}, {
             "$set": {"failed_login_count": 0},
             "$unset": {"login_block_until": "", "last_failed_login": ""}
@@ -157,6 +168,7 @@ Jika ini bukan Anda, segera ubah password Anda.
     except Exception as e:
         print(e)
         return response.error([], "Gagal login")
+
 
 
 def forgot_password():
@@ -260,3 +272,34 @@ def get_ip_location(ip):
         return "Lokasi tidak diketahui"
 
 
+@jwt_required()
+def change_password():
+    try:
+        user_id = get_jwt_identity()
+        data = request.get_json()
+
+        old_password = data.get("old_password")
+        new_password = data.get("new_password")
+
+        if not old_password or not new_password:
+            return response.error([], "Semua field harus diisi")
+
+        user = mongo.db.user.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            return response.error([], "User tidak ditemukan")
+
+        if not check_password_hash(user['password'], old_password):
+            return response.error([], "Kata sandi lama salah")
+
+        new_hash = generate_password_hash(new_password)
+        mongo.db.user.update_one({"_id": user['_id']}, {
+            "$set": {
+                "password": new_hash,
+                "updated_at": datetime.utcnow()
+            }
+        })
+
+        return response.success({}, "Kata sandi berhasil diubah")
+    except Exception as e:
+        print(e)
+        return response.error([], "Gagal mengubah kata sandi")
